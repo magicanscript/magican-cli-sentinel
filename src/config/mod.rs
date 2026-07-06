@@ -41,13 +41,19 @@ pub struct Config {
     pub alert_cooldown: Duration,
 
     // --- LLM ---
-    /// API ключ для генерации текста. Обязательное поле.
-    /// Читается из `LLM_API_KEY`.
+    /// API ключ для генерации текста. Необязательное поле.
+    /// Читается из `LLM_API_KEY`; при отсутствии — пустая строка, и заголовок
+    /// `Authorization` не отправляется (как ожидает локальная Ollama).
     pub llm_api_key: String,
 
     /// Модель для генерации текста.
     /// Читается из `LLM_MODEL`, по умолчанию "mistral-small-latest".
     pub llm_model: String,
+
+    /// Базовый URL OpenAI-совместимого API (root, без `/chat/completions`).
+    /// Читается из `LLM_BASE_URL`, по умолчанию "https://api.mistral.ai/v1".
+    /// Смена значения переключает провайдера (Ollama/OpenAI/Groq/OpenRouter).
+    pub llm_base_url: String,
 
     // --- Telegram ---
     /// Telegram bot token (format: "123456:ABC-DEF..."). Required.
@@ -60,8 +66,9 @@ pub struct Config {
 impl Config {
     /// Reads all parameters from environment variables.
     ///
-    /// Required variables: `SOLANA_TARGET_RPC_URL`, `MISTRAL_API_KEY`,
+    /// Required variables: `SOLANA_TARGET_RPC_URL`,
     /// `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+    /// `LLM_API_KEY` is optional (empty → no `Authorization` header, for Ollama).
     /// If any of them is absent — returns `Err(SentinelError::Config)`.
     ///
     /// All other variables are optional and have sensible defaults.
@@ -86,9 +93,12 @@ impl Config {
                 300,
             )?),
 
-            llm_api_key: require_var("LLM_API_KEY")?,
+            llm_api_key: env::var("LLM_API_KEY").unwrap_or_default(),
 
             llm_model: env::var("LLM_MODEL").unwrap_or_else(|_| "mistral-small-latest".to_string()),
+
+            llm_base_url: env::var("LLM_BASE_URL")
+                .unwrap_or_else(|_| "https://api.mistral.ai/v1".to_string()),
 
             telegram_bot_token: require_var("TELEGRAM_BOT_TOKEN")?,
 
@@ -100,7 +110,7 @@ impl Config {
     /// API keys are masked — only the first 8 characters are shown.
     pub fn summary(&self) -> String {
         format!(
-            "target={} reference={} interval={:?} slot_lag_threshold={} rtt_threshold_ms={}ms cooldown={:?} model={}",
+            "target={} reference={} interval={:?} slot_lag_threshold={} rtt_threshold_ms={}ms cooldown={:?} model={} base_url={}",
             self.target_rpc_url,
             self.reference_rpc_url,
             self.poll_interval,
@@ -108,6 +118,7 @@ impl Config {
             self.rtt_threshold_ms,
             self.alert_cooldown,
             self.llm_model,
+            self.llm_base_url,
         )
     }
 }

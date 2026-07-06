@@ -6,8 +6,8 @@
 /// Each variant maps to one error source:
 /// - `Config`   — errors reading configuration from env variables
 /// - `Rpc`      — errors talking to the Solana RPC (network, timeout, bad response)
-/// - `Http`     — HTTP-level errors (reqwest) for Mistral API and Telegram
-/// - `Llm`      — unexpected LLM response structure (missing JSON fields)
+/// - `Http`     — HTTP-level errors (reqwest) for the Telegram API
+/// - `LlmClient`— error surfaced by the `rust-llm-client` crate (LLM calls)
 /// - `Telegram` — Telegram Bot API returned `ok: false`
 use thiserror::Error;
 
@@ -28,10 +28,11 @@ pub enum SentinelError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// The LLM responded but the JSON structure was unexpected
-    /// (e.g. the `choices[0].message.content` field is absent).
-    #[error("Unexpected LLM response: {0}")]
-    Llm(String),
+    /// Error from the `rust-llm-client` crate: configuration, transport,
+    /// rate-limit, API status, malformed response, or JSON-parse failure.
+    /// `#[from]` auto-converts `rust_llm_client::LlmError` via `?`.
+    #[error("LLM client error: {0}")]
+    LlmClient(#[from] rust_llm_client::LlmError),
 
     /// Telegram API returned `ok: false` with an error description.
     #[error("Telegram error: {0}")]

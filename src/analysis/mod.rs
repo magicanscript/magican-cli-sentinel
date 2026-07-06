@@ -119,6 +119,7 @@ mod tests {
             alert_cooldown: Duration::from_secs(300),
             llm_api_key: "test-key".to_string(),
             llm_model: "mistral-small-latest".to_string(),
+            llm_base_url: "https://api.mistral.ai/v1".to_string(),
             telegram_bot_token: "test-token".to_string(),
             telegram_chat_id: "test-chat".to_string(),
         }

@@ -28,7 +28,7 @@ use crate::notify::TelegramClient;
 pub async fn run(cfg: Config) -> Result<()> {
     info!("daemon started: {}", cfg.summary());
 
-    let llm = LlmClient::new();
+    let llm = LlmClient::new(&cfg)?;
     let tg = TelegramClient::new();
     let mut last_alert_at: Option<Instant> = None;
     let poll_interval = cfg.poll_interval;

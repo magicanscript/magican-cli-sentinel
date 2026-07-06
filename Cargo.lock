@@ -2388,6 +2388,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-llm-client"
+version = "0.1.0"
+dependencies = [
+ "fastrand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2853,6 +2865,7 @@ dependencies = [
  "dotenvy",
  "humantime",
  "reqwest",
+ "rust-llm-client",
  "serde",
  "serde_json",
  "solana-rpc-client",

@@ -122,6 +122,7 @@ mod tests {
             alert_cooldown: Duration::from_secs(300),
             llm_api_key: "placeholder".to_string(),
             llm_model: "mistral-small-latest".to_string(),
+            llm_base_url: "https://api.mistral.ai/v1".to_string(),
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")
                 .expect("TELEGRAM_BOT_TOKEN не задан"),
             telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID не задан"),
