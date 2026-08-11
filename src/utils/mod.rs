@@ -18,11 +18,7 @@ use tracing::warn;
 /// ```ignore
 /// let slot = retry_async("get_slot", 3, || rpc.get_slot()).await?;
 /// ```
-pub async fn retry_async<F, Fut, T, E>(
-    label: &str,
-    max_attempts: u32,
-    mut op: F,
-) -> Result<T, E>
+pub async fn retry_async<F, Fut, T, E>(label: &str, max_attempts: u32, mut op: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,

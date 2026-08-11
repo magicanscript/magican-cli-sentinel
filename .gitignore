@@ -2,3 +2,5 @@
 .env
 secret.txt
 /docs
+.claude/
+.rust-review-results/
