@@ -2863,6 +2863,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "http",
  "humantime",
  "reqwest",
  "rust-llm-client",

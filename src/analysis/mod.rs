@@ -18,6 +18,10 @@ pub struct Analysis {
     /// Slot difference: `target_slot - reference_slot`.
     /// A negative value means the target node is behind the reference.
     /// For example, -12 means our node is 12 slots behind the reference.
+    ///
+    /// Saturates at `i64::MIN`/`i64::MAX` rather than wrapping when a node
+    /// reports an implausible slot number. This field is for display only —
+    /// the alert decision uses `is_slot_lagging`, which never saturates.
     pub slot_delta: i64,
 
     /// RTT of the request to the target node in milliseconds.
@@ -27,7 +31,8 @@ pub struct Analysis {
     pub reference_rtt_ms: u64,
 
     /// `true` if the target node's slot lag exceeds `slot_lag_threshold`.
-    /// Condition: `slot_delta < -(config.slot_lag_threshold as i64)`
+    /// Condition: `reference_slot - target_slot > config.slot_lag_threshold`,
+    /// evaluated in `u64` space so no hostile slot number can flip it.
     pub is_slot_lagging: bool,
 
     /// `true` if the target node's RTT exceeds `rtt_threshold_ms`.
@@ -69,17 +74,23 @@ impl Analysis {
 /// * `cfg`   — configuration with thresholds for comparison
 ///
 /// # Logic
-/// - `slot_delta` = target_slot - reference_slot (can be negative)
+/// - `slot_delta` = target_slot - reference_slot (can be negative, saturating)
 /// - The node is lagging if it is more than `slot_lag_threshold` slots behind the reference
 /// - RTT is high if it exceeds `rtt_threshold_ms`
 pub fn analyze(probe: &ProbeResult, cfg: &Config) -> Analysis {
-    // Compute slot delta.
-    // Cast u64 to i64 so the delta can be negative.
-    let slot_delta = probe.target.slot as i64 - probe.reference.slot as i64;
+    // Slot numbers arrive unvalidated from `getSlot` on two RPC endpoints, either of
+    // which may be hostile or MITM'd. Both values below are therefore computed without
+    // any arithmetic that could overflow, wrap, or panic on an adversarial `u64`.
 
-    // The node is lagging if the delta is negative AND its absolute value exceeds the threshold.
-    // Example: threshold=5, delta=-7 → lagging. delta=-3 → OK.
-    let is_slot_lagging = slot_delta < -(cfg.slot_lag_threshold as i64);
+    // Display value only: saturates instead of wrapping on implausible inputs.
+    let slot_delta = signed_slot_delta(probe.target.slot, probe.reference.slot);
+
+    // Alert decision: how far the target is *behind*, in u64 space. `saturating_sub`
+    // yields 0 when the target is level with or ahead of the reference, so the
+    // comparison stays correct for every possible pair of slot numbers.
+    // Example: threshold=5, lag=7 → lagging. lag=3 → OK.
+    let lag = probe.reference.slot.saturating_sub(probe.target.slot);
+    let is_slot_lagging = lag > cfg.slot_lag_threshold;
 
     // RTT is high if it exceeds the configured threshold in milliseconds.
     let is_rtt_high = probe.target.rtt_ms > cfg.rtt_threshold_ms;
@@ -91,6 +102,22 @@ pub fn analyze(probe: &ProbeResult, cfg: &Config) -> Analysis {
         is_slot_lagging,
         is_rtt_high,
         needs_alert: is_slot_lagging || is_rtt_high,
+    }
+}
+
+/// Signed distance `target - reference`, clamped to the `i64` range.
+///
+/// The naive `target as i64 - reference as i64` wraps (release) or panics (debug)
+/// when the two slot numbers are far enough apart, which a hostile RPC endpoint can
+/// arrange with a single crafted response. This computes the gap in `u64` space —
+/// where it always fits — and only then applies the sign, saturating if the
+/// magnitude exceeds what an `i64` can hold.
+fn signed_slot_delta(target: u64, reference: u64) -> i64 {
+    if target >= reference {
+        i64::try_from(target - reference).unwrap_or(i64::MAX)
+    } else {
+        // `try_from` yields at most `i64::MAX`, so negation never overflows.
+        i64::try_from(reference - target).map_or(i64::MIN, |gap| -gap)
     }
 }
 
@@ -215,6 +242,81 @@ mod tests {
         assert_eq!(analysis.slot_delta, 10);
         assert!(!analysis.is_slot_lagging);
         assert!(!analysis.needs_alert);
+    }
+
+    // ------------------------------------------------------------------
+    // Hostile / extreme slot numbers (ARITHOFL-001)
+    //
+    // Either RPC endpoint may return an arbitrary u64. None of the values
+    // below may panic, wrap, or flip the lag decision to a false negative.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_signed_slot_delta_saturates_instead_of_wrapping() {
+        // Ordinary cases keep their exact value and sign.
+        assert_eq!(signed_slot_delta(100, 100), 0);
+        assert_eq!(signed_slot_delta(110, 100), 10);
+        assert_eq!(signed_slot_delta(90, 100), -10);
+
+        // Gaps too large for an i64 clamp to the bounds rather than wrapping.
+        assert_eq!(signed_slot_delta(u64::MAX, 0), i64::MAX);
+        assert_eq!(signed_slot_delta(0, u64::MAX), i64::MIN);
+    }
+
+    #[test]
+    fn test_hostile_reference_slot_does_not_suppress_alert() {
+        // A malicious reference node claims a wildly high slot. The old
+        // `as i64` subtraction wrapped here and reported "not lagging";
+        // the daemon must now see a massive lag and alert.
+        let cfg = make_config(5, 500);
+        let probe = make_probe(100, 200, u64::MAX);
+        let analysis = analyze(&probe, &cfg);
+
+        assert_eq!(analysis.slot_delta, i64::MIN);
+        assert!(analysis.is_slot_lagging);
+        assert!(analysis.needs_alert);
+    }
+
+    #[test]
+    fn test_hostile_target_slot_does_not_trigger_false_alert() {
+        // A malicious target node claims a wildly high slot: it is ahead,
+        // not behind, so no slot-lag alert — and no panic on the way.
+        let cfg = make_config(5, 500);
+        let probe = make_probe(u64::MAX, 200, 100);
+        let analysis = analyze(&probe, &cfg);
+
+        assert_eq!(analysis.slot_delta, i64::MAX);
+        assert!(!analysis.is_slot_lagging);
+        assert!(!analysis.needs_alert);
+    }
+
+    #[test]
+    fn test_lag_decision_survives_every_slot_extreme() {
+        // Exhaustive over the interesting corners: no combination may panic.
+        let cfg = make_config(5, 500);
+        let extremes = [0, 1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX];
+
+        for target in extremes {
+            for reference in extremes {
+                let analysis = analyze(&make_probe(target, 200, reference), &cfg);
+                // The decision must agree with the exact unsigned lag.
+                let expected = reference.saturating_sub(target) > cfg.slot_lag_threshold;
+                assert_eq!(
+                    analysis.is_slot_lagging, expected,
+                    "target={target} reference={reference}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_max_threshold_never_reports_lagging() {
+        // An operator-set threshold of u64::MAX cannot be exceeded by any lag.
+        let cfg = make_config(u64::MAX, 500);
+        let probe = make_probe(0, 200, u64::MAX);
+        let analysis = analyze(&probe, &cfg);
+
+        assert!(!analysis.is_slot_lagging);
     }
 
     #[test]

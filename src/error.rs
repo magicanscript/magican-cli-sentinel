@@ -9,6 +9,7 @@
 /// - `Http`     — HTTP-level errors (reqwest) for the Telegram API
 /// - `LlmClient`— error surfaced by the `rust-llm-client` crate (LLM calls)
 /// - `Telegram` — Telegram Bot API returned `ok: false`
+/// - `MalformedResponse` — a peer's response was oversized or not valid JSON
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -37,4 +38,10 @@ pub enum SentinelError {
     /// Telegram API returned `ok: false` with an error description.
     #[error("Telegram error: {0}")]
     Telegram(String),
+
+    /// A remote peer's response could not be accepted: it exceeded the
+    /// response-size cap, or its body was not valid JSON.
+    /// `{0}` describes which of the two occurred.
+    #[error("Malformed response: {0}")]
+    MalformedResponse(String),
 }

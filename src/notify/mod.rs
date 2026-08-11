@@ -6,13 +6,32 @@
 ///
 /// On send error — logs via tracing::error! and returns Err.
 /// The daemon does not panic and continues running (handled at the alert level).
-use reqwest::Client;
+///
+/// The Telegram endpoint is treated as untrusted: every request is bounded by a
+/// timeout and every response body by a byte cap, so a hostile or MITM'd peer
+/// cannot stall the monitoring loop or exhaust memory.
+use std::time::Duration;
+
+use reqwest::{Client, Response};
 use serde_json::json;
 use tracing::{debug, error};
 
 use crate::config::Config;
 use crate::error::SentinelError;
 use crate::utils;
+
+/// Deadline for a single Telegram request, covering connect through body read.
+/// Without it a peer that accepts the connection and then stops sending would
+/// block the daemon's polling loop forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for establishing the TCP/TLS connection alone.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on a Telegram response body. Real `sendMessage` replies are well
+/// under a kilobyte; anything approaching this cap is a hostile peer trying to
+/// exhaust memory, not a legitimate answer.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// HTTP client for the Telegram Bot API.
 ///
@@ -23,10 +42,17 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     /// Creates a new client. Call once at application startup.
-    pub fn new() -> Self {
-        Self {
-            http: Client::new(),
-        }
+    ///
+    /// # Errors
+    /// - `SentinelError::Http` — the underlying TLS/resolver backend failed to
+    ///   initialise, which is a startup fault rather than a per-request one.
+    pub fn new() -> Result<Self, SentinelError> {
+        let http = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?;
+
+        Ok(Self { http })
     }
 
     /// Sends a text message to the Telegram chat specified in the configuration.
@@ -64,14 +90,14 @@ impl TelegramClient {
             let url = url.clone();
             let b = body.clone();
             async move {
-                http.post(url)
+                let response = http
+                    .post(url)
                     .json(&b)
                     .send()
                     .await
-                    .map_err(SentinelError::Http)?
-                    .json::<serde_json::Value>()
-                    .await
-                    .map_err(SentinelError::Http)
+                    .map_err(SentinelError::Http)?;
+
+                read_json_capped(response).await
             }
         })
         .await?;
@@ -97,6 +123,50 @@ impl TelegramClient {
     }
 }
 
+/// Reads a response body into JSON, refusing to buffer more than
+/// `MAX_RESPONSE_BYTES`.
+///
+/// `Response::json()` buffers the whole body with no upper bound, so a hostile
+/// peer can drive the daemon out of memory with one oversized reply. This reads
+/// the body chunk by chunk against a fixed budget instead, so the allocation
+/// stays bounded no matter what the peer sends.
+///
+/// A declared `Content-Length` over the cap is rejected before any body is read;
+/// a peer that lies about (or omits) it is caught by the per-chunk budget.
+async fn read_json_capped(mut response: Response) -> Result<serde_json::Value, SentinelError> {
+    if let Some(declared) = response.content_length()
+        && declared > MAX_RESPONSE_BYTES as u64
+    {
+        return Err(SentinelError::MalformedResponse(format!(
+            "response declares {declared} bytes, over the {MAX_RESPONSE_BYTES}-byte cap"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(SentinelError::Http)? {
+        check_budget(buf.len(), chunk.len())?;
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf)
+        .map_err(|e| SentinelError::MalformedResponse(format!("body is not valid JSON: {e}")))
+}
+
+/// Rejects the next chunk if accepting it would push the buffered body past
+/// `MAX_RESPONSE_BYTES`.
+///
+/// This is the guard that catches a peer which understates or omits its
+/// `Content-Length`; the declared-length check alone trusts the peer's own
+/// claim. `saturating_add` keeps the bound itself free of overflow.
+fn check_budget(buffered: usize, incoming: usize) -> Result<(), SentinelError> {
+    if buffered.saturating_add(incoming) > MAX_RESPONSE_BYTES {
+        return Err(SentinelError::MalformedResponse(format!(
+            "response body exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+        )));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -104,7 +174,116 @@ impl TelegramClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    /// Builds an in-memory `Response` with the given body — no network, no server.
+    /// `declare_len` controls whether a truthful `Content-Length` is advertised,
+    /// which lets the tests cover both the honest and the lying peer.
+    fn response_with(body: Vec<u8>, declare_len: bool) -> Response {
+        let mut builder = http::Response::builder().status(200);
+        if declare_len {
+            builder = builder.header("content-length", body.len());
+        }
+        let built = builder
+            .body(body)
+            .unwrap_or_else(|_| http::Response::new(Vec::new()));
+        Response::from(built)
+    }
+
+    #[tokio::test]
+    async fn test_read_json_capped_accepts_a_normal_reply() {
+        let body = br#"{"ok":true,"result":{"message_id":1}}"#.to_vec();
+        let value = read_json_capped(response_with(body, true))
+            .await
+            .expect("a well-formed reply must parse");
+
+        assert_eq!(value["ok"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_read_json_capped_rejects_declared_oversize_body() {
+        // Honest peer advertising a body past the cap: rejected up front.
+        let body = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+        let err = read_json_capped(response_with(body, true))
+            .await
+            .expect_err("an oversized body must be refused");
+
+        match err {
+            SentinelError::MalformedResponse(msg) => assert!(msg.contains("declares")),
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_json_capped_rejects_oversize_body_without_the_header() {
+        // Omitting the Content-Length header must not get a body past the cap.
+        // (An in-memory `Response` still knows its own length, so this lands on
+        // the declared-length check; the streaming budget that catches a peer
+        // which genuinely understates its length is covered by the
+        // `check_budget` tests below.)
+        let body = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+        let err = read_json_capped(response_with(body, false))
+            .await
+            .expect_err("an oversized body must be refused without Content-Length too");
+
+        assert!(matches!(err, SentinelError::MalformedResponse(_)));
+    }
+
+    #[test]
+    fn test_check_budget_admits_chunks_up_to_the_cap() {
+        assert!(check_budget(0, 0).is_ok());
+        assert!(check_budget(0, MAX_RESPONSE_BYTES).is_ok());
+        assert!(check_budget(MAX_RESPONSE_BYTES - 1, 1).is_ok());
+    }
+
+    #[test]
+    fn test_check_budget_rejects_the_chunk_that_crosses_the_cap() {
+        // A peer streaming past the limit is stopped at the first chunk that
+        // would exceed it — the buffer never grows beyond MAX_RESPONSE_BYTES.
+        assert!(check_budget(MAX_RESPONSE_BYTES, 1).is_err());
+        assert!(check_budget(MAX_RESPONSE_BYTES - 1, 2).is_err());
+        assert!(check_budget(0, MAX_RESPONSE_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn test_check_budget_does_not_overflow_on_absurd_lengths() {
+        // The bound itself must not wrap, even on nonsense inputs.
+        assert!(check_budget(usize::MAX, usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_json_capped_accepts_body_exactly_at_the_cap() {
+        // The cap is inclusive: a body of exactly MAX_RESPONSE_BYTES is read.
+        // Pad a valid JSON document out to the limit with insignificant spaces.
+        let prefix = br#"{"ok":true}"#;
+        let mut body = prefix.to_vec();
+        body.resize(MAX_RESPONSE_BYTES, b' ');
+
+        let value = read_json_capped(response_with(body, true))
+            .await
+            .expect("a body exactly at the cap must be accepted");
+
+        assert_eq!(value["ok"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_read_json_capped_rejects_non_json_body() {
+        let err = read_json_capped(response_with(b"<html>not json</html>".to_vec(), true))
+            .await
+            .expect_err("a non-JSON body must be refused");
+
+        match err {
+            SentinelError::MalformedResponse(msg) => assert!(msg.contains("not valid JSON")),
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_client_is_built_with_bounded_timeouts() {
+        // The constructor must not hand back a client that can hang forever.
+        assert!(TelegramClient::new().is_ok());
+        assert!(REQUEST_TIMEOUT > Duration::ZERO);
+        assert!(CONNECT_TIMEOUT <= REQUEST_TIMEOUT);
+    }
 
     /// Live integration test: real Telegram send.
     /// Run with: cargo test telegram_live -- --ignored --nocapture
@@ -128,7 +307,7 @@ mod tests {
             telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID не задан"),
         };
 
-        let client = TelegramClient::new();
+        let client = TelegramClient::new().expect("не удалось создать Telegram-клиент");
         client
             .send_message("Тест solana-cli-sentinel: Telegram-клиент работает.", &cfg)
             .await
