@@ -4,3 +4,4 @@ secret.txt
 /docs
 .claude/
 .rust-review-results/
+.remember
