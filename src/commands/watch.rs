@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::analysis;
 use crate::config::Config;
 use crate::llm::LlmClient;
-use crate::metrics;
+use crate::metrics::RpcProbe;
 use crate::notify::TelegramClient;
 
 /// Runs the infinite monitoring loop.
@@ -30,11 +30,13 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let llm = LlmClient::new(&cfg)?;
     let tg = TelegramClient::new()?;
+    // Built once so the RPC connection pool is reused across ticks.
+    let rpc = RpcProbe::new()?;
     let mut last_alert_at: Option<Instant> = None;
     let poll_interval = cfg.poll_interval;
 
     loop {
-        tick(&cfg, &llm, &tg, &mut last_alert_at).await;
+        tick(&cfg, &rpc, &llm, &tg, &mut last_alert_at).await;
 
         // Wait for the next tick or Ctrl+C.
         // tokio::select! ensures the signal is handled even during sleep.
@@ -59,12 +61,13 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// Errors are logged and do not interrupt the daemon.
 async fn tick(
     cfg: &Config,
+    rpc: &RpcProbe,
     llm: &LlmClient,
     tg: &TelegramClient,
     last_alert_at: &mut Option<Instant>,
 ) {
     // Probe both nodes in parallel
-    let probe = match metrics::probe_both(cfg).await {
+    let probe = match rpc.probe_both(cfg).await {
         Ok(p) => p,
         Err(e) => {
             error!("node probe failed: {e}");

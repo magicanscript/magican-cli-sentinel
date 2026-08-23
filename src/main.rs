@@ -17,6 +17,7 @@ mod config;
 mod error;
 mod llm;
 mod metrics;
+mod net;
 mod notify;
 mod utils;
 

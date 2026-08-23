@@ -26,7 +26,7 @@ use anyhow::Result;
 
 use crate::analysis;
 use crate::config::Config;
-use crate::metrics;
+use crate::metrics::RpcProbe;
 
 /// Performs a single node probe and prints the result to stdout.
 ///
@@ -39,7 +39,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     println!("Опрашиваю ноды...");
 
     // probe_both runs both requests in parallel
-    let probe = metrics::probe_both(&cfg).await?;
+    let rpc = RpcProbe::new()?;
+    let probe = rpc.probe_both(&cfg).await?;
     let analysis = analysis::analyze(&probe, &cfg);
 
     // Print one line per node
